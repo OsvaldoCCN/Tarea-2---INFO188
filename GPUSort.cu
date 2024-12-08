@@ -14,10 +14,11 @@
 #endif
 
 #define N_BINS (1 << K_BITS)
-#define ELEMENTS_PER_BLOCK (2 * CTA_SIZE * BLOCKSIZE)
 #define LOG_NUM_BANKS 5
 #define CONFLICT_FREE_OFFSET(n) ((n) + ((n) >> LOG_NUM_BANKS))
-
+#define ELEMENTS_PER_BLOCK (CTA_SIZE * 2 * BLOCKSIZE)
+#define GRIDSIZE 64
+#define BLOCKSIZE (n + GRIDSIZE - 1) / GRIDSIZE
 
 #define CHECK(call)                                                            \
 {                                                                              \
@@ -36,6 +37,27 @@ __device__ __forceinline__ uint32_t getBin(uint32_t val, uint32_t bit, uint32_t 
     return (val >> bit) & (nBins - 1);
 }
 
+
+/**
+ * @brief Realiza un escaneo (prefix sum) dentro de un bloque de datos, almacenando el resultado en `out`
+ *        y las sumas de bloques en `blkSums`.
+ *
+ * Este kernel calcula un escaneo (prefix sum) dentro de un bloque de elementos de un arreglo de entrada 
+ * (`src`) y guarda los resultados en el arreglo de salida (`out`). Al mismo tiempo, el kernel guarda la 
+ * suma total de cada bloque en el arreglo `blkSums` para ser usado en fases posteriores del algoritmo 
+ * de escaneo global.
+ * 
+ * El escaneo se realiza en varias fases: la fase de escaneo local (donde se calcula la suma acumulada 
+ * dentro de un bloque) y la fase de reducción (donde los resultados se consolidan a nivel de bloque).
+ * 
+ * El escaneo de los elementos se realiza en memoria compartida para optimizar el acceso a los datos.
+ * 
+ * @param src Arreglo de entrada en dispositivo que contiene los valores a ser escaneados.
+ * @param n Número total de elementos en el arreglo `src` que se deben procesar.
+ * @param out Arreglo de salida en dispositivo donde se almacenarán los resultados del escaneo.
+ * @param blkSums Arreglo en dispositivo donde se almacenarán las sumas de cada bloque. 
+ *                Este arreglo es utilizado para la fase de reducción.
+ */
 __global__ void scanBlkKernel(uint32_t * src, int n, uint32_t * out, uint32_t * blkSums) {
     extern __shared__ uint32_t s[];
     uint32_t* localScan = s;
@@ -112,6 +134,22 @@ __global__ void scanBlkKernel(uint32_t * src, int n, uint32_t * out, uint32_t * 
     }
 }
 
+
+/**
+ * @brief Realiza la suma acumulada (prefix sum) en el arreglo de salida, agregando las sumas de bloques previos.
+ *
+ * Este kernel ajusta los elementos del arreglo de salida `out` sumando la suma de los bloques anteriores. 
+ * La suma acumulada se realiza a nivel de bloques, es decir, se suma el valor de la suma total de los bloques 
+ * previos (almacenada en `blkSums`) a los elementos correspondientes en el arreglo de salida `out`.
+ * 
+ * Este kernel se ejecuta después de haber calculado las sumas de bloques individuales, y aplica la 
+ * corrección de la suma a los elementos de cada bloque de manera paralela.
+ *
+ * @param out Arreglo de salida en dispositivo donde se almacenarán los resultados de la suma acumulada.
+ * @param n Número total de elementos en el arreglo `out` que se deben procesar.
+ * @param blkSums Arreglo de dispositivo que contiene las sumas de cada bloque. Este arreglo es utilizado para
+ *               sumar el valor acumulado de los bloques anteriores a los elementos del bloque actual.
+ */
 __global__ void sumPrefixBlkKernel(uint32_t * out, int n, uint32_t * blkSums) {
     uint32_t lastBlockSum = blockIdx.x > 0 ? blkSums[blockIdx.x - 1] : 0;
     uint32_t first = ELEMENTS_PER_BLOCK * blockIdx.x;
@@ -121,12 +159,38 @@ __global__ void sumPrefixBlkKernel(uint32_t * out, int n, uint32_t * blkSums) {
     }
 }
 
+/**
+ * @brief Realiza una reducción en el arreglo de entrada, restando cada elemento del arreglo de entrada al arreglo de salida.
+ *
+ * Este kernel recibe dos arreglos, uno de entrada `in` y uno de salida `out`, y realiza la operación de resta
+ * entre los elementos correspondientes en ambos arreglos. El resultado de la resta de cada elemento de `in`
+ * se guarda en el arreglo `out`. La operación se realiza de manera paralela para cada hilo en el bloque de CUDA.
+ *
+ * @param in Arreglo de entrada en dispositivo con los valores sobre los que se realiza la operación de resta.
+ * @param n Número de elementos en el arreglo `in` que se deben procesar.
+ * @param out Arreglo de salida en dispositivo donde se almacenarán los resultados de la resta.
+ */
 __global__ void reduceKernel(uint32_t * in, int n, uint32_t * out) {
     int id_in = blockDim.x * blockIdx.x + threadIdx.x;
     if (id_in < n)
         out[id_in] -= in[id_in];
 }
 
+
+/**
+ * @brief Realiza un escaneo (prefix sum) en un arreglo de manera paralela usando CUDA.
+ *
+ * Esta función implementa un escaneo de prefijos sobre un arreglo de tamaño `n` de manera recursiva,
+ * dividiendo el trabajo entre bloques de hilos. Primero, se realiza el escaneo de cada bloque,
+ * luego se suman los resultados de los bloques, y finalmente se actualiza el arreglo de salida
+ * con el escaneo total.
+ *
+ * @param d_in Arreglo de entrada en dispositivo que contiene los datos sobre los que se realiza el escaneo.
+ * @param d_out Arreglo de salida en dispositivo que contendrá los resultados del escaneo.
+ * @param n El tamaño del arreglo de entrada (número de elementos).
+ * @param elementsPerBlock Dimensión de cada bloque (cuántos elementos maneja cada bloque).
+ * @param blockSize Tamaño del bloque (número de hilos por bloque).
+ */
 void computeScanArray(uint32_t* d_in, uint32_t* d_out, int n, dim3 elementsPerBlock, dim3 blockSize) {
     dim3 gridSize((n - 1) / elementsPerBlock.x + 1);
 
@@ -146,6 +210,22 @@ void computeScanArray(uint32_t* d_in, uint32_t* d_out, int n, dim3 elementsPerBl
     CHECK(cudaFree(d_blkSums));
 }
 
+
+/**
+ * @brief Realiza la operación de dispersión (scatter) en una matriz de enteros de 32 bits.
+ * 
+ * Esta función toma una matriz de entrada, dispersa sus elementos a las posiciones adecuadas en la matriz
+ * de salida según un cálculo basado en el histograma escaneado. Los hilos se encargan de colocar los valores 
+ * dispersados en las posiciones correctas en la matriz de destino utilizando un esquema de dispersión 
+ * eficiente en paralelo.
+ * 
+ * @param src Puntero a la matriz de entrada de tipo `uint32_t`, cuyos elementos serán dispersados.
+ * @param n Número de elementos en la matriz `src`.
+ * @param dst Puntero a la matriz de salida de tipo `uint32_t`, donde se almacenarán los elementos dispersados.
+ * @param histScan Puntero a un histograma previamente escaneado que ayuda a calcular las posiciones de dispersión.
+ * @param bit El bit actual que se está utilizando para la dispersión.
+ * @param count Puntero a la matriz `count` que almacena el número de elementos que ya se han procesado.
+ */
 __global__ void scatterKernel(uint32_t* src, int n, uint32_t* dst, uint32_t* histScan, int bit, uint32_t* count) {
     extern __shared__ uint32_t start[];
     uint32_t first = N_BINS * blockIdx.x;
@@ -166,6 +246,22 @@ __global__ void scatterKernel(uint32_t* src, int n, uint32_t* dst, uint32_t* his
     }
 }
 
+
+/**
+ * @brief Realiza el ordenamiento local utilizando el algoritmo Radix Sort en la GPU.
+ * 
+ * Este kernel realiza el ordenamiento local de elementos usando el algoritmo Radix Sort. La implementación
+ * utiliza un esquema de memoria compartida para almacenar los elementos de la entrada y el resultado de los 
+ * cálculos intermedios, optimizando las fases de escaneo, reducción y dispersión (scatter). El kernel usa 
+ * múltiples fases de reducción para procesar los datos de manera eficiente en paralelo.
+ * 
+ * @param src Puntero a la matriz de entrada de tipo `uint32_t` que contiene los elementos a ordenar.
+ * @param n Número de elementos en la matriz `src`.
+ * @param bit El bit actual que se está utilizando para el ordenamiento.
+ * @param count Puntero a la matriz `count` que lleva el registro de las posiciones de los elementos.
+ * @param hist Puntero al histograma que almacena los resultados intermedios del ordenamiento.
+ * @param start_pos Posición inicial del bloque de trabajo (valor predeterminado es 0).
+ */
 __global__ void sortLocalKernel(uint32_t* src, int n, int bit, uint32_t* count, uint32_t* hist, int start_pos = 0) {
     extern __shared__ uint32_t s[];
     uint32_t* localSrc = s;
@@ -342,6 +438,19 @@ __global__ void sortLocalKernel(uint32_t* src, int n, int bit, uint32_t* count, 
         hist[first + digit] = s_hist[CONFLICT_FREE_OFFSET(digit)];
 }
 
+
+/**
+ * @brief Realiza la transposición de una matriz de enteros de 32 bits en la GPU.
+ * 
+ * Esta función toma una matriz de entrada y genera su transpuesta. La transposición se realiza
+ * utilizando memoria compartida para reducir la latencia y aumentar la eficiencia en el acceso a los datos.
+ * La operación se realiza en paralelo con múltiples bloques y hilos de la GPU.
+ * 
+ * @param iMatrix Puntero a la matriz de entrada de tipo `uint32_t`, que contiene los elementos a transponer.
+ * @param oMatrix Puntero a la matriz de salida de tipo `uint32_t`, donde se almacenarán los elementos transpuestos.
+ * @param rows Número de filas de la matriz original.
+ * @param cols Número de columnas de la matriz original.
+ */
 __global__ void transpose(uint32_t *iMatrix, uint32_t *oMatrix, int rows, int cols) {
     __shared__ int s_blkData[32][33];
     int iR = blockIdx.x * blockDim.x + threadIdx.y;
@@ -355,6 +464,20 @@ __global__ void transpose(uint32_t *iMatrix, uint32_t *oMatrix, int rows, int co
         oMatrix[oR * rows + oC] = s_blkData[threadIdx.x][threadIdx.y];
 }
 
+
+/**
+* @brief Ordena un arreglo de enteros de 32 bits con radix paralelo en CUDA.
+*
+* La función sort implementa el algoritmo radixSort de ordenamiento paralelo en CUDA para un arreglo de enteros de 32 bits (uint32_t).
+* El algoritmo se basa en el enfoque de ordenamiento por clasificación (radix sort), que maneja números enteros en sus 
+* diferentes bits en iteraciones, distribuyendo los valores en "bins" y realizando operaciones de escaneo (scan) y 
+* dispersión (scatter). El proceso se lleva a cabo en múltiples fases de forma paralela, aprovechando múltiples streams 
+* de CUDA para mejorar la eficiencia.
+*
+* @param in: Puntero a un arreglo de enteros de 32 bits a ordenar.
+* @param n: Número de elementos en el arreglo.
+* @param out: Puntero a un arreglo de enteros de 32 bits donde se almacenarán los elementos ordenados.
+*/
 void sort(const uint32_t * in, int n, uint32_t * out) {
     uint32_t * d_src;
     uint32_t * d_dst;
@@ -366,9 +489,10 @@ void sort(const uint32_t * in, int n, uint32_t * out) {
     CHECK(cudaMalloc(&d_dst, n * sizeof(uint32_t)));
 
     // Compute block and grid size for scan and scatter phase
+    dim3 gridSize(GRIDSIZE);
     dim3 blockSize(BLOCKSIZE);
     dim3 elementsPerBlock(ELEMENTS_PER_BLOCK);
-    dim3 gridSize((n - 1) / elementsPerBlock.x + 1);
+
     dim3 blockSizeTranspose(32, 32);
     dim3 gridSizeTransposeHist((gridSize.x - 1) / blockSizeTranspose.x + 1, (N_BINS - 1) / blockSizeTranspose.x + 1);
     dim3 gridSizeTransposeHistScan((N_BINS - 1) / blockSizeTranspose.x + 1, (gridSize.x - 1) / blockSizeTranspose.x + 1);

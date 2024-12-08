@@ -2,8 +2,26 @@
 #include <omp.h>
 #include <iostream>
 
-#define DEPTH 4
+#define DEPTH 14
 
+
+/**
+* @brief Ordena un vector de elementos de tipo T en paralelo usando el algoritmo de MergeSort
+*
+* Primero divide el arreglo en dos mitades y luego ordena recursivamente cada mitad.
+* Para mejorar el rendimiento en sistemas con múltiples núcleos, al alcanzar una profundidad 
+* máxima definida por el parámetro DEPTH, utiliza las directivas de OpenMP para ejecutar estas 
+* divisiones y ordenaciones en paralelo. Una vez que ambas mitades están ordenadas, 
+* las fusiona en un solo arreglo ordenado. Este enfoque aprovecha la paralelización en 
+* CPU para optimizar el tiempo de ejecución.
+*
+* @param arr Vector de elementos de tipo T a ordenar
+* @param left Índice del primer elemento del vector a ordenar
+* @param right Índice del último elemento del vector a ordenar
+* @param depth Profundidad actual de la recursión
+*
+* @return Vector de elementos de tipo T ordenado
+*/
 template<typename T> std::vector<T> recursiveMergeSort( std::vector<T> arr, int left, int right, int depth) {
     if(arr.size() == 1){
         return arr;
